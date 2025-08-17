@@ -1,105 +1,104 @@
 import sqlite3
 import json
+import logging
+from threading import Lock
+
 
 class DatabaseManager:
     def __init__(self, db_name='words_bot.db'):
         self.db_name = db_name
-        self.conn = None
+        self.lock = Lock()  # Для thread-safety
         self.init_db()
 
     def init_db(self):
         """Ініціалізація бази даних"""
-        self.conn = sqlite3.connect(self.db_name)
-        cursor = self.conn.cursor()
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
 
-        # Перевіряємо чи існує таблиця users
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
-        table_exists = cursor.fetchone() is not None
-
-        if table_exists:
-            # Якщо таблиця існує, створюємо нову без зайвих колонок
+            # Створюємо таблицю з правильною структурою
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users_new (
-                user_id INTEGER PRIMARY KEY,
-                words TEXT,
-                current_index INTEGER DEFAULT 0
-            )
-            ''')
+                           CREATE TABLE IF NOT EXISTS users
+                           (
+                               user_id
+                               INTEGER
+                               PRIMARY
+                               KEY,
+                               words
+                               TEXT
+                               DEFAULT
+                               '[]',
+                               current_index
+                               INTEGER
+                               DEFAULT
+                               0,
+                               created_at
+                               TIMESTAMP
+                               DEFAULT
+                               CURRENT_TIMESTAMP,
+                               updated_at
+                               TIMESTAMP
+                               DEFAULT
+                               CURRENT_TIMESTAMP
+                           )
+                           ''')
 
-            # Копіюємо тільки потрібні дані
+            # Створюємо індекс для швидшого пошуку
             cursor.execute('''
-            INSERT INTO users_new (user_id, words, current_index)
-            SELECT user_id, words, current_index FROM users
-            ''')
+                           CREATE INDEX IF NOT EXISTS idx_user_id ON users(user_id)
+                           ''')
 
-            # Видаляємо стару таблицю і перейменовуємо нову
-            cursor.execute("DROP TABLE users")
-            cursor.execute("ALTER TABLE users_new RENAME TO users")
-
-            self.conn.commit()
-        else:
-            # Створюємо нову таблицю
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                words TEXT,
-                current_index INTEGER DEFAULT 0
-            )
-            ''')
-            self.conn.commit()
+            conn.commit()
 
     def get_user_data(self, user_id):
         """Отримання даних користувача з БД"""
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
-        cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-        user_record = cursor.fetchone()
-        conn.close()
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_name) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        'SELECT words, current_index FROM users WHERE user_id = ?',
+                        (user_id,)
+                    )
+                    result = cursor.fetchone()
 
-        if user_record:
-            # Розпакування даних з БД
-            user_id, words_json, current_index = user_record
-
-            return {
-                'words': json.loads(words_json),
-                'current_index': current_index
-            }
-        else:
-            # Користувача ще немає в БД
-            return None
+                    if result:
+                        words_json, current_index = result
+                        return {
+                            'words': json.loads(words_json) if words_json else [],
+                            'current_index': current_index or 0
+                        }
+                    return None
+            except Exception as e:
+                logging.error(f"Помилка при отриманні даних користувача {user_id}: {e}")
+                return None
 
     def save_user_data(self, user_id, data):
         """Збереження даних користувача в БД"""
-        conn = sqlite3.connect(self.db_name)
-        cursor = conn.cursor()
+        with self.lock:
+            try:
+                with sqlite3.connect(self.db_name) as conn:
+                    cursor = conn.cursor()
 
-        # Перетворюємо списки на JSON для зберігання
-        words_json = json.dumps(data['words'])
+                    words_json = json.dumps(data['words'], ensure_ascii=False)
 
-        # Перевіряємо, чи існує вже запис для користувача
-        cursor.execute('SELECT 1 FROM users WHERE user_id = ?', (user_id,))
-        user_exists = cursor.fetchone() is not None
+                    cursor.execute('''
+                    INSERT OR REPLACE INTO users 
+                    (user_id, words, current_index, updated_at)
+                    VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                    ''', (user_id, words_json, data['current_index']))
 
-        if user_exists:
-            # Оновлюємо існуючий запис
-            cursor.execute('''
-            UPDATE users SET 
-                words = ?,
-                current_index = ?
-            WHERE user_id = ?
-            ''', (words_json, data['current_index'], user_id))
-        else:
-            # Створюємо новий запис
-            cursor.execute('''
-            INSERT INTO users 
-                (user_id, words, current_index)
-            VALUES (?, ?, ?)
-            ''', (user_id, words_json, data['current_index']))
+                    conn.commit()
+            except Exception as e:
+                logging.error(f"Помилка при збереженні даних користувача {user_id}: {e}")
 
-        conn.commit()
-        conn.close()
+    def get_user_count(self):
+        """Отримати кількість користувачів"""
+        with sqlite3.connect(self.db_name) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM users')
+            return cursor.fetchone()[0]
 
     def close(self):
         """Закриття з'єднання з БД"""
-        if self.conn:
-            self.conn.close()
+        # SQLite автоматично закриває з'єднання при використанні context manager
+        pass

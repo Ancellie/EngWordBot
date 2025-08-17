@@ -1,13 +1,18 @@
-import re
-import random
 import atexit
-
-import page
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from db_manager import DatabaseManager
 
-TOKEN = ""
+import os
+from dotenv import load_dotenv
+
+# Завантажуємо змінні з .env файлу
+load_dotenv()
+
+TOKEN = os.getenv('TELEGRAM_TOKEN')
+
+if not TOKEN:
+    raise ValueError("TELEGRAM_TOKEN не знайдено! Перевір файл .env")
 
 # Ініціалізуємо менеджер бази даних
 db = DatabaseManager()
@@ -29,7 +34,8 @@ def init_user_data(user_id):
             # Якщо даних немає, створюємо нові
             user_data[user_id] = {
                 'words': [],  # [(eng, ukr), ...]
-                'current_index': 0
+                'current_index': 0,
+                'show_translation': False  # Додаємо флаг для показу перекладу
             }
             # Зберігаємо початкові дані в БД
             db.save_user_data(user_id, user_data[user_id])
@@ -100,6 +106,24 @@ def get_manage_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
+def get_word_keyboard(show_translation=False):
+    """Створення клавіатури для роботи зі словом"""
+    if not show_translation:
+        # Якщо переклад ще не показано
+        keyboard = [
+            [InlineKeyboardButton("👁️ Побачити переклад", callback_data="show_translation")],
+            [InlineKeyboardButton("➡️ Наступне слово", callback_data="next_word")],
+            [InlineKeyboardButton("🏠 Головне меню", callback_data="back_to_main")]
+        ]
+    else:
+        # Якщо переклад уже показано
+        keyboard = [
+            [InlineKeyboardButton("➡️ Наступне слово", callback_data="next_word")],
+            [InlineKeyboardButton("🏠 Головне меню", callback_data="back_to_main")]
+        ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
     user_id = update.effective_user.id
@@ -147,6 +171,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "next_word":
         await show_next_word(query, user_id)
 
+    elif data == "show_translation":
+        await show_translation(query, user_id)
+
     elif data == "stats":
         await show_stats(query, user_id)
 
@@ -162,6 +189,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "confirm_delete_all":
         user_data[user_id]['words'] = []
         user_data[user_id]['current_index'] = 0
+        user_data[user_id]['show_translation'] = False
 
         # Зберігаємо оновлені дані в БД
         db.save_user_data(user_id, user_data[user_id])
@@ -196,10 +224,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-
-
 async def show_next_word(query, user_id):
-    """Показати наступне слово"""
+    """Показати наступне слово (спочатку без перекладу)"""
     words = user_data[user_id]['words']
 
     if not words:
@@ -217,18 +243,41 @@ async def show_next_word(query, user_id):
     # Переходимо до наступного слова
     user_data[user_id]['current_index'] = (user_data[user_id]['current_index'] + 1) % len(words)
 
+    # Скидаємо флаг показу перекладу для нового слова
+    user_data[user_id]['show_translation'] = False
+
     # Зберігаємо оновлені дані користувача в БД
     db.save_user_data(user_id, user_data[user_id])
 
-    # Додаємо кнопки для управління
-    keyboard = [
-        [InlineKeyboardButton("➡️ Наступне слово", callback_data="next_word")],
-        [InlineKeyboardButton("🏠 Головне меню", callback_data="back_to_main")]
-    ]
+    # Формуємо повідомлення - показуємо тільки англійське слово
+    text = f"🔤 *{word}*\n\n💭 Спробуй згадати переклад!"
+    await query.edit_message_text(text, reply_markup=get_word_keyboard(False), parse_mode="Markdown")
 
-    # Формуємо повідомлення та відправляємо
-    text = f"🔤 {word} - {translation}"
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def show_translation(query, user_id):
+    """Показати переклад поточного слова"""
+    words = user_data[user_id]['words']
+
+    if not words:
+        await query.edit_message_text(
+            "📭 У тебе ще немає слів! Додай їх спочатку.",
+            reply_markup=get_main_keyboard()
+        )
+        return
+
+    # Отримуємо попередній індекс (оскільки в show_next_word ми вже перейшли до наступного)
+    prev_idx = (user_data[user_id]['current_index'] - 1) % len(words)
+    word, translation = words[prev_idx]
+
+    # Встановлюємо флаг що переклад показано
+    user_data[user_id]['show_translation'] = True
+
+    # Зберігаємо оновлені дані користувача в БД
+    db.save_user_data(user_id, user_data[user_id])
+
+    # Формуємо повідомлення з перекладом
+    text = f"🔤 *{word}*\n\n✅ Переклад: *{translation}*"
+    await query.edit_message_text(text, reply_markup=get_word_keyboard(True), parse_mode="Markdown")
 
 
 async def show_stats(query, user_id):
@@ -236,13 +285,13 @@ async def show_stats(query, user_id):
     words = user_data[user_id]['words']
     total_words = len(words)
 
-    stats_text = f"""📊 **Статистика:**
+    stats_text = f"""📊 *Статистика:*
 
 📚 Всього слів: {total_words}
 
 {f"▶️ Поточне слово: {user_data[user_id]['current_index'] + 1}/{total_words}" if total_words > 0 else ""}"""
 
-    await query.edit_message_text(stats_text, reply_markup=get_main_keyboard())
+    await query.edit_message_text(stats_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
 
 async def confirm_delete_all(query, user_id):
@@ -256,8 +305,6 @@ async def confirm_delete_all(query, user_id):
         f"⚠️ Ти впевнений що хочеш видалити всі {len(user_data[user_id]['words'])} слів?",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
-
-
 
 
 async def delete_specific_word(query, user_id, word_index):
@@ -283,104 +330,6 @@ async def delete_specific_word(query, user_id, word_index):
             "❌ Помилка при видаленні слова!",
             reply_markup=get_manage_keyboard()
         )
-
-
-    async def show_all_words(query, user_id, page=0):
-        """Показати всі слова з пагінацією"""
-    words = user_data[user_id]['words']
-
-    if not words:
-        await query.edit_message_text(
-            "📭 У тебе ще немає слів!",
-            reply_markup=get_manage_keyboard()
-        )
-        return
-
-    # Кількість слів на сторінці
-    page_size = 20
-    total_pages = (len(words) + page_size - 1) // page_size
-
-    # Визначаємо діапазон слів для поточної сторінки
-    start_idx = page * page_size
-    end_idx = min(start_idx + page_size, len(words))
-
-    # Формуємо текст зі словами
-    text = f"📚 **Твої слова ({len(words)}):**\n"
-    text += f"Сторінка {page+1}/{total_pages} (слова {start_idx+1}-{end_idx})\n\n"
-
-    for i in range(start_idx, end_idx):
-        word, translation = words[i]
-        text += f"{i+1}. {word} - {translation}\n"
-
-    # Створюємо кнопки навігації
-    keyboard = []
-    nav_buttons = []
-
-    # Кнопка «Назад» на попередню сторінку
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"words_page_{page-1}"))
-
-    # Кнопка «Вперед» на наступну сторінку
-    if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"words_page_{page+1}"))
-
-    # Додаємо навігаційні кнопки, якщо їх більше нуля
-    if nav_buttons:
-        keyboard.append(nav_buttons)
-
-    # Кнопка повернення до меню управління
-    keyboard.append([InlineKeyboardButton("↩️ До меню керування", callback_data="manage_words")])
-
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-
-
-    async def show_all_words(query, user_id, page=0):
-        """Показати всі слова з пагінацією"""
-    words = user_data[user_id]['words']
-
-    if not words:
-        await query.edit_message_text(
-            "📭 У тебе ще немає слів!",
-            reply_markup=get_manage_keyboard()
-        )
-        return
-
-    # Кількість слів на сторінці
-    page_size = 20
-    total_pages = (len(words) + page_size - 1) // page_size
-
-    # Визначаємо діапазон слів для поточної сторінки
-    start_idx = page * page_size
-    end_idx = min(start_idx + page_size, len(words))
-
-    # Формуємо текст зі словами
-    text = f"📚 **Твої слова ({len(words)}):**\n"
-    text += f"Сторінка {page+1}/{total_pages} (слова {start_idx+1}-{end_idx})\n\n"
-
-    for i in range(start_idx, end_idx):
-        word, translation = words[i]
-        text += f"{i+1}. {word} - {translation}\n"
-
-    # Створюємо кнопки навігації
-    keyboard = []
-    nav_buttons = []
-
-    # Кнопка «Назад» на попередню сторінку
-    if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"words_page_{page-1}"))
-
-    # Кнопка «Вперед» на наступну сторінку
-    if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"words_page_{page+1}"))
-
-    # Додаємо навігаційні кнопки, якщо їх більше нуля
-    if nav_buttons:
-        keyboard.append(nav_buttons)
-
-    # Кнопка повернення до меню управління
-    keyboard.append([InlineKeyboardButton("↩️ До меню керування", callback_data="manage_words")])
-
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
 async def show_words_for_deletion(query, user_id, page=0):
@@ -421,11 +370,11 @@ async def show_words_for_deletion(query, user_id, page=0):
 
     # Кнопка «Назад» на попередню сторінку
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"delete_page_{page-1}"))
+        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"delete_page_{page - 1}"))
 
     # Кнопка «Вперед» на наступну сторінку
     if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"delete_page_{page+1}"))
+        nav_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"delete_page_{page + 1}"))
 
     # Додаємо навігаційні кнопки, якщо їх більше нуля
     if nav_buttons:
@@ -435,10 +384,10 @@ async def show_words_for_deletion(query, user_id, page=0):
     keyboard.append([InlineKeyboardButton("↩️ До меню керування", callback_data="manage_words")])
 
     # Формуємо текст повідомлення
-    text = f"🗑️ Вибери слово для видалення (сторінка {page+1}/{total_pages}):\n"
-    text += f"Показано слова {start_idx+1}-{end_idx} з {len(words)}"
+    text = f"🗑️ Вибери слово для видалення (сторінка {page + 1}/{total_pages}):\n"
+    text += f"Показано слова {start_idx + 1}-{end_idx} з {len(words)}"
 
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
 
 
 async def show_all_words(query, user_id, page=0):
@@ -461,12 +410,12 @@ async def show_all_words(query, user_id, page=0):
     end_idx = min(start_idx + page_size, len(words))
 
     # Формуємо текст зі словами
-    text = f"📚 **Твої слова ({len(words)}):**\n"
-    text += f"Сторінка {page+1}/{total_pages} (слова {start_idx+1}-{end_idx})\n\n"
+    text = f"📚 *Твої слова ({len(words)}):*\n"
+    text += f"Сторінка {page + 1}/{total_pages} (слова {start_idx + 1}-{end_idx})\n\n"
 
     for i in range(start_idx, end_idx):
         word, translation = words[i]
-        text += f"{i+1}. {word} - {translation}\n"
+        text += f"{i + 1}. {word} - {translation}\n"
 
     # Створюємо кнопки навігації
     keyboard = []
@@ -474,11 +423,11 @@ async def show_all_words(query, user_id, page=0):
 
     # Кнопка «Назад» на попередню сторінку
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"words_page_{page-1}"))
+        nav_buttons.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"words_page_{page - 1}"))
 
     # Кнопка «Вперед» на наступну сторінку
     if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"words_page_{page+1}"))
+        nav_buttons.append(InlineKeyboardButton("Вперед ➡️", callback_data=f"words_page_{page + 1}"))
 
     # Додаємо навігаційні кнопки, якщо їх більше нуля
     if nav_buttons:
